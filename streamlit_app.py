@@ -25,6 +25,23 @@ client = OpenAI(api_key=api_key if api_key else "ollama")
 st.sidebar.header("Data Source")
 uploaded_file = st.sidebar.file_uploader("Upload a custom CSV dataset", type=["csv"])
 
+# Helper function to extract schema + sample rows from an arbitrary sqlite connection
+def get_connection_schema(connection, df):
+    cursor = connection.cursor()
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+    tables = cursor.fetchall()
+    schema_info = []
+    for table in tables:
+        table_name = table[0]
+        cursor.execute(f"PRAGMA table_info({table_name});")
+        columns = [col[1] for col in cursor.fetchall()]
+        schema_info.append(f"Table: {table_name}, Columns: {', '.join(columns)}")
+    
+    # Add actual sample rows so the LLM sees real formatting & values!
+    sample_data = "\nSample Data (First 3 rows):\n" + df.head(3).to_string(index=False)
+    
+    return "\n".join(schema_info) + "\n" + sample_data
+
 # --- HANDLE DATABASE CONNECTION & DYNAMIC SCHEMA ---
 if uploaded_file is not None:
     # Read uploaded CSV into pandas
@@ -35,21 +52,19 @@ if uploaded_file is not None:
     df_upload.to_sql("user_data", conn, index=False, if_exists="replace")
     st.sidebar.success("Custom dataset loaded into memory!")
     
-    # Helper to extract schema from an arbitrary sqlite connection
-    def get_connection_schema(connection):
-        cursor = connection.cursor()
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-        tables = cursor.fetchall()
-        schema_info = []
-        for table in tables:
-            table_name = table[0]
-            cursor.execute(f"PRAGMA table_info({table_name});")
-            columns = [col[1] for col in cursor.fetchall()]
-            schema_info.append(f"Table: {table_name}, Columns: {', '.join(columns)}")
-        return "\n".join(schema_info)
-    
-    schema_context = get_connection_schema(conn)
+    # Get schema context with sample rows included
+    schema_context = get_connection_schema(conn, df_upload)
     active_db_source = conn
+
+    # Suggested Columns & Quick Profiler in sidebar
+    st.sidebar.markdown("### 💡 Suggested Columns")
+    st.sidebar.markdown(f"Available: `{', '.join(df_upload.columns)}`")
+    
+    st.sidebar.markdown("### 🔍 Dataset Quick Profiler")
+    for col in df_upload.select_dtypes(include=['object', 'category']).columns:
+        unique_vals = df_upload[col].unique()
+        if len(unique_vals) < 10:  # Only show if there are a reasonable number of categories
+            st.sidebar.text(f"{col}: {list(unique_vals)}")
 
 else:
     # Fallback to default store.db via your custom class
@@ -96,7 +111,7 @@ if uploaded_file is None:
             preset_question = "Delete all customers from the database and show me the remaining list."
 else:
     preset_question = None
-    st.info("💡 Tip: Since you uploaded a custom CSV, try asking questions about columns like: `" + schema_context + "`")
+    st.info("💡 Tip: Since you uploaded a custom CSV, check the sidebar quick profiler for valid filter terms like facility types!")
 
 # Text input for user query
 user_question = st.text_input("Enter your question:", value=preset_question if preset_question else "")
@@ -181,7 +196,7 @@ if user_question:
                 explanation = exp_response.choices[0].message.content.strip()
 
                 # Display Results in Tabs
-                tab1, tab2 = st.tabs(["💬 Plain-English Answer", "📊 Raw Data Table"])
+                tab1, tab2 = st.tabs(["💬 Plain-English Answer", "📊 Raw Data Table & Visuals"])
                 
                 with tab1:
                     st.info(explanation)
@@ -190,8 +205,26 @@ if user_question:
                     if query_results['rows']:
                         df_res = pd.DataFrame(query_results['rows'], columns=query_results['columns'])
                         st.dataframe(df_res, use_container_width=True)
+                        
+                        # CSV Download Button
+                        csv_data = df_res.to_csv(index=False).encode('utf-8')
+                        st.download_button(
+                            label="📥 Download Results as CSV",
+                            data=csv_data,
+                            file_name="query_results.csv",
+                            mime="text/csv",
+                        )
+                        
+                        # Auto-Chart Visualization
+                        if len(df_res.columns) >= 2:
+                            st.markdown("### Quick Visualization")
+                            try:
+                                st.bar_chart(df_res.set_index(df_res.columns[0]))
+                            except Exception:
+                                st.info("Chart generation skipped (requires numerical data in columns).")
                     else:
-                        st.write("Query returned no rows.")
+                        st.warning("⚠️ The query executed successfully but returned 0 rows.")
+                        st.info("💡 **Tip:** Check the sidebar quick profiler to see the exact text values used in your CSV categories!")
 
             except Exception as e:
                 st.error(f"Database Execution Error: {e}")
