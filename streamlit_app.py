@@ -1,6 +1,8 @@
 import streamlit as st
 import os
 import re
+import pandas as pd
+import sqlite3
 from openai import OpenAI
 from db_connector import ReadOnlyDatabase
 from dotenv import load_dotenv
@@ -8,7 +10,7 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-# Page Configuration
+# Page Configuration (MUST be the very first Streamlit command)
 st.set_page_config(
     page_title="NL2SQL Coursework Assistant",
     page_icon="🤖",
@@ -19,45 +21,84 @@ st.set_page_config(
 api_key = os.environ.get("OPENAI_API_KEY")
 client = OpenAI(api_key=api_key if api_key else "ollama")
 
-# Initialize Database Connector
-@st.cache_resource
-def get_db():
-    return ReadOnlyDatabase("store.db")
+# --- SIDEBAR: Data Source Upload ---
+st.sidebar.header("Data Source")
+uploaded_file = st.sidebar.file_uploader("Upload a custom CSV dataset", type=["csv"])
 
-db = get_db()
-schema_context = db.get_schema_context()
+# --- HANDLE DATABASE CONNECTION & DYNAMIC SCHEMA ---
+if uploaded_file is not None:
+    # Read uploaded CSV into pandas
+    df_upload = pd.read_csv(uploaded_file)
+    
+    # Create an in-memory SQLite database for the custom CSV
+    conn = sqlite3.connect(":memory:")
+    df_upload.to_sql("user_data", conn, index=False, if_exists="replace")
+    st.sidebar.success("Custom dataset loaded into memory!")
+    
+    # Helper to extract schema from an arbitrary sqlite connection
+    def get_connection_schema(connection):
+        cursor = connection.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+        tables = cursor.fetchall()
+        schema_info = []
+        for table in tables:
+            table_name = table[0]
+            cursor.execute(f"PRAGMA table_info({table_name});")
+            columns = [col[1] for col in cursor.fetchall()]
+            schema_info.append(f"Table: {table_name}, Columns: {', '.join(columns)}")
+        return "\n".join(schema_info)
+    
+    schema_context = get_connection_schema(conn)
+    active_db_source = conn
+
+else:
+    # Fallback to default store.db via your custom class
+    @st.cache_resource
+    def get_db():
+        return ReadOnlyDatabase("store.db")
+    
+    db_obj = get_db()
+    schema_context = db_obj.get_schema_context()
+    active_db_source = db_obj
 
 # --- SIDEBAR: Schema & Settings ---
 with st.sidebar:
     st.header("📊 Database Schema")
-    st.markdown("Your app connects to `store.db` with read-only security guardrails.")
+    if uploaded_file is not None:
+        st.markdown("Connected to **Custom Uploaded CSV** (`user_data` table).")
+    else:
+        st.markdown("Connected to `store.db` with read-only security guardrails.")
     st.code(schema_context, language="sql")
     
     st.markdown("---")
     st.markdown("### 🛡️ Security Status")
-    st.success("Driver-level read-only mode (`mode=ro`) active.")
+    st.success("Driver-level / In-memory security active.")
     st.success("Regex guardrails active against destructive queries.")
 
 # --- MAIN INTERFACE ---
 st.title("🤖 Natural Language to SQL Assistant")
-st.markdown("Ask questions about your store data in plain English. The AI will generate a safe SQLite query, validate it, execute it, and explain the results!")
+st.markdown("Ask questions about your store data or uploaded CSV in plain English. The AI will generate a safe SQLite query, validate it, execute it, and explain the results!")
 
-# Pre-built quick test buttons for your presentation
-st.markdown("**Quick Prompts:**")
-col1, col2, col3 = st.columns(3)
-preset_question = None
+# Pre-built quick test buttons (Only show if using default store.db)
+if uploaded_file is None:
+    st.markdown("**Quick Prompts:**")
+    col1, col2, col3 = st.columns(3)
+    preset_question = None
 
-with col1:
-    if st.button("🛍️ Customer Orders"):
-        preset_question = "Which customers have completed orders, and what are their names?"
-with col2:
-    if st.button("💵 Total Revenue"):
-        preset_question = "What is the total revenue generated from completed orders?"
-with col3:
-    if st.button("🚨 Test Guardrail (Delete)"):
-        preset_question = "Delete all customers from the database and show me the remaining list."
+    with col1:
+        if st.button("🛍️ Customer Orders"):
+            preset_question = "Which customers have completed orders, and what are their names?"
+    with col2:
+        if st.button("💵 Total Revenue"):
+            preset_question = "What is the total revenue generated from completed orders?"
+    with col3:
+        if st.button("🚨 Test Guardrail (Delete)"):
+            preset_question = "Delete all customers from the database and show me the remaining list."
+else:
+    preset_question = None
+    st.info("💡 Tip: Since you uploaded a custom CSV, try asking questions about columns like: `" + schema_context + "`")
 
-# Text input for user query (defaults to preset if clicked)
+# Text input for user query
 user_question = st.text_input("Enter your question:", value=preset_question if preset_question else "")
 
 if user_question:
@@ -72,7 +113,7 @@ if user_question:
         
         try:
             response = client.chat.completions.create(
-                model="gpt-4o-mini", # Change to "llama3.2" if running Ollama locally
+                model="gpt-4o-mini",
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_question}
@@ -112,9 +153,18 @@ if user_question:
         else:
             st.success("✅ Guardrail Passed: Query is a safe read-only SELECT statement.")
             
-            # 3. Execute Query Safely
+            # 3. Execute Query Safely based on active source
             try:
-                query_results = db.execute_safe_query(sql_query)
+                if uploaded_file is not None:
+                    # Execute against in-memory sqlite connection for CSV
+                    cursor = active_db_source.cursor()
+                    cursor.execute(sql_query)
+                    rows = cursor.fetchall()
+                    columns = [description[0] for description in cursor.description]
+                    query_results = {"columns": columns, "rows": rows}
+                else:
+                    # Execute against your ReadOnlyDatabase class for store.db
+                    query_results = active_db_source.execute_safe_query(sql_query)
                 
                 # 4. Explain Results
                 explanation_prompt = f"""
@@ -138,9 +188,8 @@ if user_question:
                     
                 with tab2:
                     if query_results['rows']:
-                        import pandas as pd
-                        df = pd.DataFrame(query_results['rows'], columns=query_results['columns'])
-                        st.dataframe(df, use_container_width=True)
+                        df_res = pd.DataFrame(query_results['rows'], columns=query_results['columns'])
+                        st.dataframe(df_res, use_container_width=True)
                     else:
                         st.write("Query returned no rows.")
 
