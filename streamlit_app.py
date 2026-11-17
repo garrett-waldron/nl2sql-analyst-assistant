@@ -44,8 +44,9 @@ def get_connection_schema(connection, df):
 
 # --- HANDLE DATABASE CONNECTION & DYNAMIC SCHEMA ---
 if uploaded_file is not None:
-    # Read uploaded CSV into pandas
+    # Read uploaded CSV into pandas and strip hidden whitespace from headers
     df_upload = pd.read_csv(uploaded_file)
+    df_upload.columns = df_upload.columns.str.strip()
     
     # Create an in-memory SQLite database for the custom CSV
     conn = sqlite3.connect(":memory:")
@@ -116,14 +117,64 @@ else:
 # Text input for user query
 user_question = st.text_input("Enter your question:", value=preset_question if preset_question else "")
 
+# --- SELF-HEALING RETRY FUNCTION ---
+def run_sql_with_retry(sql_query, active_source, is_csv, user_q, schema_ctx):
+    for attempt in range(2):  # Initial try + 1 auto-fix retry
+        try:
+            if is_csv:
+                cursor = active_source.cursor()
+                cursor.execute(sql_query)
+                rows = cursor.fetchall()
+                columns = [desc[0] for desc in cursor.description]
+                return {"columns": columns, "rows": rows}, sql_query
+            else:
+                return active_source.execute_safe_query(sql_query), sql_query
+                
+        except Exception as db_error:
+            if attempt == 0:
+                # Ask the LLM to fix its own SQL using the exact SQLite error message
+                fix_prompt = f"""
+                The following SQLite query failed:
+                Query: {sql_query}
+                Error: {db_error}
+                Schema: {schema_ctx}
+                User Question: {user_q}
+                
+                Fix the SQLite SELECT query so it executes without errors. Return ONLY raw SQL.
+                """
+                fix_resp = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[{"role": "user", "content": fix_prompt}],
+                    temperature=0.0
+                )
+                sql_query = fix_resp.choices[0].message.content.strip()
+                sql_query = re.sub(r"^```sql\s*|^```\s*|\s*```\$", "", sql_query, flags=re.IGNORECASE).strip()
+                
+                # Re-validate guardrails on the fixed query!
+                if not sql_query.upper().startswith("SELECT") or any(
+                    re.search(r'\b' + w + r'\b', sql_query.upper()) 
+                    for w in ["DROP", "DELETE", "UPDATE", "INSERT", "ALTER", "TRUNCATE", "CREATE", "REPLACE"]
+                ):
+                    raise ValueError("Self-healed query violated read-only guardrails.")
+            else:
+                raise db_error
+
 if user_question:
     with st.spinner("Processing your question..."):
         
-        # 1. Generate SQL
+        # 1. Generate SQL with Advanced Rules
         system_prompt = f"""
-        You are an expert SQL assistant. Convert natural language questions into safe SQLite SELECT queries based on this schema:
+        You are an expert SQLite data analyst. Convert natural language questions into safe, accurate SQLite SELECT queries based on this schema:
         {schema_context}
-        CRITICAL: Return ONLY raw SQL. No markdown blocks, no conversational text. Write ONLY SELECT statements.
+        
+        CRITICAL RULES:
+        1. Return ONLY raw SQL. No markdown blocks, no conversational text, and no trailing semicolons. Write ONLY SELECT statements.
+        2. ALWAYS wrap every column name and table name in double quotes (e.g., SELECT "Column Name" FROM "user_data") to prevent syntax errors from spaces or special characters.
+        3. FUZZY TEXT MATCHING: Never use exact '=' matches for string filters unless matching an ID or exact code. Always use case-insensitive LIKE with wildcards (e.g., WHERE LOWER("Facility Type") LIKE '%hospital%') so partial or differently capitalized values still match.
+        4. NULL & BLANK HANDLING: Exclude NULLs and empty strings when calculating averages, minimums, or grouping.
+        5. SAFE MATH & TYPE CASTING: Cast numeric columns explicitly when aggregating (e.g., AVG(CAST("Violation Rate" AS REAL))) and use NULLIF to prevent division-by-zero errors.
+        6. RESULT LIMITS: If the user asks for "all", "list", or doesn't specify a limit on a raw row query, append LIMIT 50 so the UI doesn't freeze on massive CSVs.
+        7. SQLITE DIALECT ONLY: Only use valid SQLite functions.
         """
         
         try:
@@ -168,23 +219,17 @@ if user_question:
         else:
             st.success("✅ Guardrail Passed: Query is a safe read-only SELECT statement.")
             
-            # 3. Execute Query Safely based on active source
+            # 3. Execute Query Safely with Self-Healing Retry Loop
             try:
-                if uploaded_file is not None:
-                    # Execute against in-memory sqlite connection for CSV
-                    cursor = active_db_source.cursor()
-                    cursor.execute(sql_query)
-                    rows = cursor.fetchall()
-                    columns = [description[0] for description in cursor.description]
-                    query_results = {"columns": columns, "rows": rows}
-                else:
-                    # Execute against your ReadOnlyDatabase class for store.db
-                    query_results = active_db_source.execute_safe_query(sql_query)
+                is_csv_source = (uploaded_file is not None)
+                query_results, final_executed_sql = run_sql_with_retry(
+                    sql_query, active_db_source, is_csv_source, user_question, schema_context
+                )
                 
                 # 4. Explain Results
                 explanation_prompt = f"""
                 The user asked: "{user_question}"
-                The executed SQL: {sql_query}
+                The executed SQL: {final_executed_sql}
                 Results (Columns: {query_results['columns']}, Rows: {query_results['rows']}):
                 Provide a concise, clear plain-English summary of these results.
                 """
